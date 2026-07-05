@@ -420,6 +420,150 @@ repository = https://github.com/<you>/asdf-<tool>
 | Shim not found after install | Shims not regenerated | Run `asdf reshim <tool>` |
 | `asdf current` shows wrong version | `ASDF_<TOOL>_VERSION` env set | `unset ASDF_<TOOL>_VERSION` |
 | `asdf where` returns empty | Version not installed | Run `asdf install <tool> <version>` first |
+| `trap EXIT` fails with `unbound variable` | `local` vars not in scope when trap fires | Use double-quoted trap to capture value at definition time (see Non-Standard section) |
+| Install "succeeds" but asdf reports failure | `trap EXIT` exits non-zero | Add `|| true` to every command in trap that can fail (e.g. `hdiutil detach`) |
+
+---
+
+## Non-Standard Release Patterns
+
+Most plugins take ~30 lines and work first try. Some tools break assumptions. Audit the upstream release page before writing any code.
+
+### Pre-flight checklist — run before writing a single line
+
+```bash
+# 1. Inspect release tags — what is the format?
+gh api "repos/OWNER/REPO/tags?per_page=10" --jq '.[].name'
+# Standard:  v1.2.3
+# Non-std:   tool-2021.01  / 1.2.3-release / 20240101
+
+# 2. Inspect release assets — what files are published?
+gh api "repos/OWNER/REPO/releases/latest" --jq '.assets[].name'
+# Standard:  tool_1.2.3_linux_amd64.tar.gz
+# Non-std:   Tool-1.2.3.dmg / Tool-1.2.3-x86_64.AppImage / tool-setup.exe
+
+# 3. Check platform/arch coverage
+# Missing arm64? Missing Linux? macOS only? Source-only older versions?
+```
+
+### Non-standard tag prefix
+
+When tag is `tool-1.2.3` instead of `v1.2.3`:
+
+```bash
+# bin/list-all — strip the tool- prefix, not just v
+curl -fsSL "https://api.github.com/repos/OWNER/REPO/releases?per_page=100" \
+  | grep '"tag_name"' \
+  | sed 's/.*"tag_name": "tool-\([^"]*\)".*/\1/' \
+  | sort -V
+
+# bin/install — reconstruct tag with prefix when building URL
+url="https://github.com/OWNER/REPO/releases/download/tool-${version}/..."
+```
+
+### macOS DMG
+
+DMG requires mount → copy → unmount. Three gotchas:
+
+1. **App bundle name often includes version**: `Tool-1.2.3.app`, not `Tool.app` — always `ls` the mounted volume to confirm
+2. **`trap EXIT` + `local` vars = unbound variable**: trap fires outside function scope; use double-quoted string so value is captured at definition time
+3. **`hdiutil detach` called twice**: once explicitly on success, once in trap — add `|| true` to trap or it exits non-zero and asdf reports failure
+
+```bash
+install_tool() {
+  local version="$ASDF_INSTALL_VERSION"
+  local install_path="$ASDF_INSTALL_PATH"
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  # Double-quoted: $tmp_dir expands NOW, hardcoded into trap string
+  # || true: hdiutil may already be detached on success path — must not fail
+  trap "hdiutil detach '$tmp_dir/mnt' -quiet 2>/dev/null || true; rm -rf '$tmp_dir'" EXIT
+
+  curl -fsSL "https://.../Tool-${version}.dmg" -o "$tmp_dir/tool.dmg"
+
+  mkdir -p "$tmp_dir/mnt"
+  hdiutil attach "$tmp_dir/tool.dmg" -quiet -nobrowse -mountpoint "$tmp_dir/mnt"
+
+  # Confirm actual .app name before writing — it often includes the version
+  cp -R "$tmp_dir/mnt/Tool-${version}.app" "$install_path/"
+  hdiutil detach "$tmp_dir/mnt" -quiet  # explicit detach; trap is the fallback
+
+  # Symlink for stable wrapper — decouples wrapper from versioned app name
+  ln -sf "Tool-${version}.app" "$install_path/Tool.app"
+
+  mkdir -p "$install_path/bin"
+  cat > "$install_path/bin/tool" << 'WRAPPER'
+#!/usr/bin/env bash
+exec "$(dirname "$(dirname "$0")")/Tool.app/Contents/MacOS/Tool" "$@"
+WRAPPER
+  chmod +x "$install_path/bin/tool"
+}
+
+install_tool
+```
+
+### Linux AppImage
+
+AppImage is a self-contained executable — no extraction needed:
+
+```bash
+mkdir -p "$install_path/bin"
+curl -fsSL "https://.../Tool-${version}-x86_64.AppImage" -o "$install_path/bin/tool"
+chmod +x "$install_path/bin/tool"
+
+# If AppImage requires FUSE and it's unavailable, add --appimage-extract-and-run:
+# Wrap with: exec "$real_binary" --appimage-extract-and-run "$@"
+```
+
+Only x86_64 AppImages are common. If no ARM64 binary exists, fail clearly:
+
+```bash
+arch="$(uname -m)"
+if [[ "$arch" != "x86_64" ]]; then
+  echo "Error: No pre-built binary for $arch. See https://upstream.example.com/build" >&2
+  exit 1
+fi
+```
+
+### Sparse releases (few versions with binaries)
+
+When only recent releases have binaries but `list-all` shows many:
+
+```bash
+# Option A: filter list-all to only versions >= MIN_VERSION with assets
+# (complex — requires N API calls)
+
+# Option B (recommended): list all, fail clearly in install
+if ! curl -fsSL --head "$url" 2>/dev/null | grep -q "200 OK"; then
+  echo "Error: No binary for version $version on $platform." >&2
+  echo "       Binary releases start at X.Y. Run 'asdf list all <tool>'." >&2
+  exit 1
+fi
+```
+
+### Non-semver version format (e.g. YYYY.MM)
+
+`sort -V` handles `YYYY.MM` correctly — no special treatment needed. But the tag regex must match the full prefix:
+
+```bash
+# Tag: openscad-2021.01 → version: 2021.01
+sed 's/.*"tag_name": "openscad-\([^"]*\)".*/\1/'
+# URL reconstruction:
+url=".../openscad-${version}/OpenSCAD-${version}.dmg"
+```
+
+### `asdf plugin update` not picking up local changes
+
+When developing with a local path, asdf clones the repo at `plugin add` time. **Commit first, then add** — or run `asdf plugin update <tool>` after each commit to pull the latest.
+
+```bash
+# Correct order:
+git add bin/install && git commit -m "fix: ..."
+asdf plugin remove <tool>
+asdf plugin add <tool> /path/to/asdf-<tool>
+# OR: asdf plugin update <tool>  (no need to remove)
+```
 
 ---
 
